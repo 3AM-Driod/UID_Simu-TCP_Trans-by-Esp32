@@ -1,0 +1,489 @@
+#include <stdio.h>
+#include <string.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/event_groups.h"
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "esp_log.h"
+#include "esp_netif.h"
+#include "esp_timer.h"
+#include "nvs_flash.h"
+#include "lwip/err.h"
+#include "lwip/sockets.h"
+#include "lwip/sys.h"
+#include "lwip/netdb.h"
+#include "tinyusb.h"
+#include "tusb.h"
+#include "class/hid/hid_device.h"
+
+// 配置信息
+#define WIFI_SSID      "密码8个8"
+#define WIFI_PASS      "1055480154"
+#define SERVER_IP      "192.168.31.220"
+#define SERVER_PORT    8080
+
+static const char *TAG = "HID_TCP_Client";
+
+// WiFi连接状态
+static EventGroupHandle_t wifi_event_group;
+const int WIFI_CONNECTED_BIT = BIT0;
+
+// 鼠标控制变量
+static int8_t current_x = 0, current_y = 0;
+static int8_t current_wheel_v = 0, current_wheel_h = 0;
+static uint8_t current_buttons = 0;
+static TaskHandle_t mouse_task_handle = NULL;
+
+// ============================ HID鼠标部分 ============================
+
+static const uint8_t hid_report_descriptor[] = {
+    0x05, 0x01,        // Usage Page (Generic Desktop)
+    0x09, 0x02,        // Usage (Mouse)
+    0xA1, 0x01,        // Collection (Application)
+    
+    // 按钮字节1 (8个按钮位)
+    0x05, 0x09,        // Usage Page (Button)
+    0x19, 0x01,        // Usage Minimum (1)
+    0x29, 0x08,        // Usage Maximum (8)
+    0x15, 0x00,        // Logical Minimum (0)
+    0x25, 0x01,        // Logical Maximum (1)
+    0x95, 0x08,        // Report Count (8)
+    0x75, 0x01,        // Report Size (1)
+    0x81, 0x02,        // Input (Data,Var,Abs)
+    
+    // 按钮字节2 (保留位/扩展按钮)
+    0x95, 0x08,        // Report Count (8)
+    0x75, 0x01,        // Report Size (1)
+    0x81, 0x03,        // Input (Const,Var,Abs)
+    
+    // X位移 (-127 到 +127)
+    0x05, 0x01,        // Usage Page (Generic Desktop)
+    0x09, 0x30,        // Usage (X)
+    0x15, 0x81,        // Logical Minimum (-127)
+    0x25, 0x7F,        // Logical Maximum (127)
+    0x75, 0x08,        // Report Size (8)
+    0x95, 0x01,        // Report Count (1)
+    0x81, 0x06,        // Input (Data,Var,Rel)
+    
+    // X方向向量 (-1, 0)
+    0x09, 0x3A,        // Usage (X Tilt)
+    0x15, 0xFF,        // Logical Minimum (-1)
+    0x25, 0x00,        // Logical Maximum (0)
+    0x75, 0x08,        // Report Size (8)
+    0x95, 0x01,        // Report Count (1)
+    0x81, 0x06,        // Input (Data,Var,Rel)
+    
+    // Y位移 (-127 到 +127)
+    0x09, 0x31,        // Usage (Y)
+    0x15, 0x81,        // Logical Minimum (-127)
+    0x25, 0x7F,        // Logical Maximum (127)
+    0x75, 0x08,        // Report Size (8)
+    0x95, 0x01,        // Report Count (1)
+    0x81, 0x06,        // Input (Data,Var,Rel)
+    
+    // Y方向向量 (-1, 0)
+    0x09, 0x3B,        // Usage (Y Tilt)
+    0x15, 0xFF,        // Logical Minimum (-1)
+    0x25, 0x00,        // Logical Maximum (0)
+    0x75, 0x08,        // Report Size (8)
+    0x95, 0x01,        // Report Count (1)
+    0x81, 0x06,        // Input (Data,Var,Rel)
+    
+    // 垂直滚轮
+    0x09, 0x38,        // Usage (Wheel)
+    0x15, 0x81,        // Logical Minimum (-127)
+    0x25, 0x7F,        // Logical Maximum (127)
+    0x75, 0x08,        // Report Size (8)
+    0x95, 0x01,        // Report Count (1)
+    0x81, 0x06,        // Input (Data,Var,Rel)
+    
+    // 水平滚轮
+    0x05, 0x0C,        // Usage Page (Consumer)
+    0x0A, 0x38, 0x02,  // Usage (AC Pan)
+    0x15, 0x81,        // Logical Minimum (-127)
+    0x25, 0x7F,        // Logical Maximum (127)
+    0x75, 0x08,        // Report Size (8)
+    0x95, 0x01,        // Report Count (1)
+    0x81, 0x06,        // Input (Data,Var,Rel)
+    
+    0xC0               // End Collection
+};
+
+static const tusb_desc_device_t desc_dev = {
+    .bLength            = 0x12,
+    .bDescriptorType    = 0x01,
+    .bcdUSB             = 0x0200,
+    .bDeviceClass       = 0x00,
+    .bDeviceSubClass    = 0x00,
+    .bDeviceProtocol    = 0x00,
+    .bMaxPacketSize0    = 64,
+    .idVendor           = 0x046D,
+    .idProduct          = 0xC088,
+    .bcdDevice          = 0x2703,
+    .iManufacturer      = 0x01,
+    .iProduct           = 0x02,
+    .iSerialNumber      = 0x03,
+    .bNumConfigurations = 0x01
+};
+
+static const char* desc_str[] = {
+    "\x09\x04",
+    "Logitech",
+    "G502 HERO SE",
+    "910-005631"
+};
+
+typedef struct __attribute__((packed)) {
+    uint8_t buttons;
+    uint8_t buttons2;
+    int8_t x;
+    int8_t x_d;
+    int8_t y;
+    int8_t y_d;
+    int8_t wheel_v;
+    int8_t wheel_h;
+} mouse_report_t;
+
+#define CONFIG_TOTAL_LEN    (TUD_CONFIG_DESC_LEN + TUD_HID_DESC_LEN)
+static const uint8_t desc_configuration[] = {
+    TUD_CONFIG_DESCRIPTOR(1, 1, 0, CONFIG_TOTAL_LEN, TUSB_DESC_CONFIG_ATT_REMOTE_WAKEUP, 100),
+    TUD_HID_DESCRIPTOR(0, 4, false, sizeof(hid_report_descriptor), 0x81, 8, 1)
+};
+
+// HID回调函数
+uint8_t const * tud_hid_descriptor_report_cb(uint8_t instance) {
+    return hid_report_descriptor;
+}
+
+uint16_t tud_hid_get_report_cb(uint8_t instance, uint8_t report_id, 
+                               hid_report_type_t report_type, uint8_t* buffer, uint16_t reqlen) {
+    return 0;
+}
+
+void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id,
+                          hid_report_type_t report_type, uint8_t const* buffer, uint16_t bufsize) {
+}
+
+bool tud_hid_set_idle_cb(uint8_t instance, uint8_t idle_rate) {
+    return true;
+}
+
+void tud_hid_set_protocol_cb(uint8_t instance, uint8_t protocol) {
+    ESP_LOGI(TAG, "Protocol Changed: %s", protocol == HID_PROTOCOL_BOOT ? "BOOT" : "REPORT");
+}
+
+void tud_hid_report_complete_cb(uint8_t instance, uint8_t const* report, uint16_t len) {
+}
+
+static void usb_event_cb(tinyusb_event_t *event, void *arg) {
+    switch (event->id) {
+        case TINYUSB_EVENT_ATTACHED:
+            ESP_LOGI(TAG, "USB Connected to Host");
+            break;
+        case TINYUSB_EVENT_DETACHED:
+            ESP_LOGI(TAG, "USB Disconnected from Host");
+            break;
+        default:
+            break;
+    }
+}
+
+static int8_t calculate_direction(int8_t value) {
+    if (value < 0) return -1;
+    return 0;
+}
+
+// 发送鼠标报告函数
+bool send_mouse_report_ex(int8_t x, int8_t y, int8_t wheel_v, int8_t wheel_h, uint8_t buttons) {
+    if (!tud_hid_ready()) {
+        return false;
+    }
+
+    mouse_report_t report = {
+        .buttons = buttons & 0xFF,
+        .buttons2 = 0x00,
+        .x = x,
+        .x_d = calculate_direction(x),
+        .y = y,
+        .y_d = calculate_direction(y),
+        .wheel_v = wheel_v,
+        .wheel_h = wheel_h
+    };
+    
+    bool result = tud_hid_report(0, &report, sizeof(report));
+    return result;
+}
+
+// ============================ TCP客户端部分 ============================
+
+static void wifi_event_handler(void* arg, esp_event_base_t event_base,
+                                int32_t event_id, void* event_data) {
+    if (event_base == WIFI_EVENT) {
+        switch (event_id) {
+            case WIFI_EVENT_STA_START:
+                ESP_LOGI(TAG, "WiFi站点模式启动");
+                esp_wifi_connect();
+                break;
+            case WIFI_EVENT_STA_CONNECTED:
+                ESP_LOGI(TAG, "已连接到AP");
+                break;
+            case WIFI_EVENT_STA_DISCONNECTED: {
+                wifi_event_sta_disconnected_t* event = (wifi_event_sta_disconnected_t*) event_data;
+                ESP_LOGW(TAG, "WiFi连接断开, 原因: %d", event->reason);
+                vTaskDelay(3000 / portTICK_PERIOD_MS);
+                esp_wifi_connect();
+                xEventGroupClearBits(wifi_event_group, WIFI_CONNECTED_BIT);
+                break;
+            }
+            default:
+                break;
+        }
+    }
+}
+
+static void ip_event_handler(void* arg, esp_event_base_t event_base,
+                                int32_t event_id, void* event_data) {
+    if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
+        ESP_LOGI(TAG, "获取到IP地址: " IPSTR, IP2STR(&event->ip_info.ip));
+        xEventGroupSetBits(wifi_event_group, WIFI_CONNECTED_BIT);
+    }
+}
+
+static void wifi_init_sta(void) {
+    ESP_LOGI(TAG, "初始化WiFi...");
+    
+    wifi_event_group = xEventGroupCreate();
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    esp_netif_t *sta_netif = esp_netif_create_default_wifi_sta();
+    assert(sta_netif);
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+    // 优化WiFi配置
+    wifi_country_t country = {
+        .cc = "CN", .schan = 1, .nchan = 13, .max_tx_power = 20, .policy = WIFI_COUNTRY_POLICY_AUTO
+    };
+    esp_wifi_set_country(&country);
+    esp_wifi_set_ps(WIFI_PS_NONE);
+
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &ip_event_handler, NULL));
+
+    wifi_config_t wifi_config = {
+        .sta = {
+            .ssid = WIFI_SSID,
+            .password = WIFI_PASS,
+            .scan_method = WIFI_FAST_SCAN,
+            .sort_method = WIFI_CONNECT_AP_BY_SIGNAL,
+            .threshold = {.rssi = -127, .authmode = WIFI_AUTH_WPA2_PSK},
+        },
+    };
+    
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
+}
+
+// 简化的指令解析逻辑 - 只解析 "buttons, x, y\n" 格式
+static void parse_mouse_command(const char* command) {
+    ESP_LOGI(TAG, "收到原始指令: %s", command);
+    
+    // 去除换行符（如果有）
+    char cleaned_cmd[128];
+    strncpy(cleaned_cmd, command, sizeof(cleaned_cmd) - 1);
+    cleaned_cmd[sizeof(cleaned_cmd) - 1] = '\0';
+    
+    // 去除末尾的换行符
+    char *newline = strchr(cleaned_cmd, '\n');
+    if (newline) *newline = '\0';
+    
+    // 解析格式: "buttons, x, y"
+    int buttons_val = 0, x_val = 0, y_val = 0;
+    int parsed_count = sscanf(cleaned_cmd, "%d, %d, %d", &buttons_val, &x_val, &y_val);
+    
+    if (parsed_count == 3) {
+        // 限制数值范围
+        current_buttons = (uint8_t)(buttons_val & 0xFF);  // 确保在0-255范围内
+        current_x = (int8_t)(x_val > 127 ? 127 : (x_val < -127 ? -127 : x_val));
+        current_y = (int8_t)(y_val > 127 ? 127 : (y_val < -127 ? -127 : y_val));
+        
+        ESP_LOGI(TAG, "✅ 解析成功: 按钮=0x%02X, X=%d, Y=%d", 
+                current_buttons, current_x, current_y);
+    } else {
+        ESP_LOGW(TAG, "⚠️ 指令格式错误，期望: buttons, x, y");
+        ESP_LOGW(TAG, "⚠️ 实际收到: %s", cleaned_cmd);
+        ESP_LOGW(TAG, "⚠️ 成功解析字段数: %d/3", parsed_count);
+    }
+}
+
+
+
+// 修改mouse_control_task函数
+static void mouse_control_task(void *pvParameters) {
+    ESP_LOGI(TAG, "鼠标控制任务启动");
+    
+    
+    while (1) {
+        if (tud_hid_ready()) {
+            send_mouse_report_ex(current_x, current_y, current_wheel_v, current_wheel_h, current_buttons);
+            // 重置移动和滚轮值（按钮状态保持）
+            current_x = current_y = 0;
+            current_wheel_v = current_wheel_h = 0;
+        }        
+        vTaskDelay(10 / portTICK_PERIOD_MS); // 100Hz更新率
+    }
+}
+// TCP客户端任务
+static void tcp_client_task(void *pvParameters) {
+    static char rx_buffer[128];
+    static char tx_buffer[256];
+    
+    ESP_LOGI(TAG, "等待WiFi连接...");
+    xEventGroupWaitBits(wifi_event_group, WIFI_CONNECTED_BIT, false, true, portMAX_DELAY);
+
+    while (1) {
+        struct sockaddr_in server_addr;
+        int sock = socket(AF_INET, SOCK_STREAM, 0);
+        if (sock < 0) {
+            ESP_LOGE(TAG, "创建socket失败");
+            vTaskDelay(1000 / portTICK_PERIOD_MS);
+            continue;
+        }
+
+        // 设置socket参数
+        int tcp_no_delay = 1;
+        setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &tcp_no_delay, sizeof(tcp_no_delay));
+        
+        struct timeval timeout = {1, 0};
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+
+        server_addr.sin_family = AF_INET;
+        server_addr.sin_port = htons(SERVER_PORT);
+        inet_pton(AF_INET, SERVER_IP, &server_addr.sin_addr);
+
+        ESP_LOGI(TAG, "连接服务器 %s:%d", SERVER_IP, SERVER_PORT);
+        
+        if (connect(sock, (struct sockaddr *)&server_addr, sizeof(server_addr)) != 0) {
+            ESP_LOGE(TAG, "连接服务器失败");
+            close(sock);
+            vTaskDelay(1000 / portTICK_PERIOD_MS);
+            continue;
+        }
+
+        ESP_LOGI(TAG, "成功连接到服务器!");
+        
+        // 发送连接消息
+        int64_t connect_time = esp_timer_get_time();
+        snprintf(tx_buffer, sizeof(tx_buffer), "HID_MOUSE_CONNECTED|%lld", connect_time);
+        send(sock, tx_buffer, strlen(tx_buffer), 0);
+
+        while (1) {
+            // 接收数据
+            int len = recv(sock, rx_buffer, sizeof(rx_buffer) - 1, 0);
+            if (len < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    vTaskDelay(10 / portTICK_PERIOD_MS);
+                    continue;
+                }
+                ESP_LOGE(TAG, "接收数据失败");
+                break;
+            } else if (len == 0) {
+                ESP_LOGI(TAG, "服务器断开连接");
+                break;
+            } else {
+                rx_buffer[len] = '\0';
+                ESP_LOGI(TAG, "收到指令: %s", rx_buffer);
+                
+                // 解析并执行鼠标指令
+                parse_mouse_command(rx_buffer);
+                
+                // 发送响应
+                snprintf(tx_buffer, sizeof(tx_buffer), "ACK|%s", rx_buffer);
+                if (send(sock, tx_buffer, strlen(tx_buffer), 0) < 0) {
+                    ESP_LOGE(TAG, "发送响应失败");
+                    break;
+                }
+            }
+        }
+        
+        close(sock);
+        ESP_LOGI(TAG, "连接关闭，准备重连...");
+        vTaskDelay(1000 / portTICK_PERIOD_MS);
+    }
+}
+
+void app_main(void) {
+    ESP_LOGI(TAG, "🚀 ESP32-S3 HID鼠标TCP控制器启动");
+    
+    // 初始化NVS
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
+
+    // 初始化USB HID
+    ESP_LOGI(TAG, "初始化USB HID...");
+    
+    tinyusb_desc_config_t desc_config = {
+        .device = &desc_dev,
+        .qualifier = NULL,
+        .string = desc_str,
+        .string_count = 4,
+        .full_speed_config = desc_configuration,
+        .high_speed_config = NULL
+    };
+    
+    tinyusb_phy_config_t phy_config = {
+        .skip_setup = false,
+        .self_powered = false,
+        .vbus_monitor_io = -1
+    };
+    
+    tinyusb_task_config_t task_config = {
+        .size = 4096,
+        .priority = 5,
+        .xCoreID = 0
+    };
+    
+    tinyusb_config_t config = {
+        .port = TINYUSB_PORT_FULL_SPEED_0,
+        .phy = phy_config,
+        .task = task_config,
+        .descriptor = desc_config,
+        .event_cb = usb_event_cb,
+        .event_arg = NULL
+    };
+    
+    ret = tinyusb_driver_install(&config);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "TinyUSB驱动安装失败: %s", esp_err_to_name(ret));
+        return;
+    }
+    
+    ESP_LOGI(TAG, "TinyUSB驱动安装成功");
+
+    // 初始化WiFi
+    wifi_init_sta();
+    
+    // 创建鼠标控制任务
+    xTaskCreate(mouse_control_task, "mouse_control", 4096, NULL, 8, &mouse_task_handle);
+    
+    // 创建TCP客户端任务
+    xTaskCreate(tcp_client_task, "tcp_client", 8192, NULL, 6, NULL);
+
+    ESP_LOGI(TAG, "系统初始化完成，等待USB连接和WiFi连接...");
+    
+    // 主循环 - 处理USB事件
+    while (1) {
+        tud_task();
+        vTaskDelay(100 / portTICK_PERIOD_MS);
+    }
+}
